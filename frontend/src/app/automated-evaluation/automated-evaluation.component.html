@@ -1,0 +1,282 @@
+<div class="eval-page d-flex flex-column">
+  <div class="bg-white border-bottom py-3">
+    <div class="container-fluid">
+      <h4 class="mb-1">Automated Evaluation</h4>
+      <p class="text-muted small mb-0">
+        Start chats with bots, send questions automatically then download a scored report.
+      </p>
+    </div>
+  </div>
+
+  <div class="container-fluid p-3 d-flex flex-column flex-grow-1">
+    <div class="card shadow-sm mb-3">
+      <div class="card-body">
+        <label class="form-label small fw-medium mb-1">Chat credentials</label>
+        <div class="input-group mb-2">
+          <input
+            type="text"
+            class="form-control credentials-input"
+            placeholder="bot1 pass1, bot2 pass2"
+            [formControl]="credentialsInput"
+            [disabled]="startingChats || askingQuestions"
+            (keyup.enter)="startChats()">
+          <input
+            #credentialsFile
+            type="file"
+            accept=".txt,text/plain"
+            hidden
+            (change)="importCredentialsFile($event)">
+          <button
+            class="btn btn-outline-secondary"
+            type="button"
+            [disabled]="startingChats || askingQuestions"
+            (click)="credentialsFile.click()">
+            <i class="fa fa-upload me-1"></i>
+            Import
+          </button>
+        </div>
+        <div class="text-muted small mb-3">
+          Type <code>bot1 pass1, bot2 pass2</code>, or Import a text file with
+          <code>botname-password</code> pairs (one per line or comma-separated). Bots must already be logged in to answer.
+        </div>
+        <div class="d-flex flex-wrap gap-2">
+          <button class="btn btn-primary" type="button" [disabled]="!canStartChats" (click)="startChats()">
+            <i class="fa fa-comments me-1"></i>
+            <span *ngIf="!startingChats">Start Chats</span>
+            <span *ngIf="startingChats">Starting...</span>
+          </button>
+          <button class="btn btn-outline-secondary" type="button" [disabled]="!canSeeQuestions" (click)="seeQuestions()">
+            <i class="fa fa-eye me-1"></i>
+            See Questions
+          </button>
+          <button class="btn btn-outline-primary" type="button" [disabled]="!canAskQuestions" (click)="askQuestions()">
+            <i class="fa fa-question-circle me-1"></i>
+            <span *ngIf="!askingQuestions">Ask Questions</span>
+            <span *ngIf="askingQuestions">Asking...</span>
+          </button>
+          <button class="btn btn-outline-danger" type="button" [disabled]="!canCloseChats" (click)="closeChats()">
+            <i class="fa fa-times me-1"></i>
+            <span *ngIf="!closingChats">Close Chats</span>
+            <span *ngIf="closingChats">Closing...</span>
+          </button>
+          <button class="btn btn-success" type="button" [disabled]="!canFinish" (click)="finishEvaluation()">
+            <i class="fa fa-flag-checkered me-1"></i>
+            Finish Evaluation
+          </button>
+        </div>
+        <div class="small text-muted mt-2" *ngIf="currentQuestionLabel">
+          <i class="fa fa-spinner fa-spin me-1"></i>{{ currentQuestionLabel }}
+        </div>
+      </div>
+    </div>
+
+    <div class="card shadow-sm mb-3" *ngIf="rankedChats.length > 0 && totalAsked > 0">
+      <div class="card-body py-2">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h6 class="mb-0">Live ranking</h6>
+          <span class="text-muted small">Avg reply {{ formatResponseTime(overallAvgResponseTimeMs) }}</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm mb-0 align-middle">
+            <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Chat</th>
+              <th>Correct</th>
+              <th>Incorrect</th>
+              <th>Timeouts</th>
+              <th>Grade</th>
+              <th>Avg time</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr *ngFor="let row of rankedChats" [class.table-warning]="row.rank === 1 && row.total > 0">
+              <td>
+                <span class="badge" [ngClass]="row.rank === 1 ? 'bg-warning text-dark' : 'bg-secondary'">#{{ row.rank }}</span>
+              </td>
+              <td>{{ row.username }}</td>
+              <td class="text-success">{{ row.correct }}</td>
+              <td class="text-danger">{{ row.incorrect }}</td>
+              <td class="text-warning">{{ row.timeouts }}</td>
+              <td>{{ formatGrade(row.grade) }}</td>
+              <td>{{ formatResponseTime(row.avgResponseTimeMs) }}</td>
+            </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="overflow-x-auto d-flex my-0 flex-grow-1 eval-chats">
+      <div *ngIf="chats.length === 0" class="d-flex justify-content-center align-items-center w-100">
+        <div class="text-center text-secondary">
+          <h5>No evaluation chats yet</h5>
+          <p class="mb-0">Enter bot credentials above and press Start Chats.</p>
+        </div>
+      </div>
+
+      <div *ngFor="let chat of chats" id="evalchat{{chat.paneLog.roomID}}" class="eval-chat-col">
+        <div class="px-2 pt-2 d-flex align-items-center justify-content-between">
+          <span class="d-flex align-items-center gap-1">
+            <span class="badge bg-warning text-dark" *ngIf="rankFor(chat) === 1">#1</span>
+            <span class="badge bg-secondary" *ngIf="rankFor(chat) && rankFor(chat) !== 1">#{{ rankFor(chat) }}</span>
+            <span class="badge bg-dark">{{ chat.username }}</span>
+            <span class="badge bg-success" *ngIf="isChatFinished(chat)">Finish</span>
+            <span class="badge bg-primary" *ngIf="gradeFor(chat) > 0">{{ formatGrade(gradeFor(chat)) }} pts</span>
+          </span>
+          <span class="d-flex align-items-center gap-1">
+            <span class="badge bg-light text-dark" *ngIf="chat.lastResponseMs != null">{{ formatResponseTime(chat.lastResponseMs) }}</span>
+            <span *ngIf="scoreRatioFor(chat) as ratio"
+                  class="badge"
+                  [ngClass]="{
+                    'bg-success': chat.lastVerdict === 'correct',
+                    'bg-danger': chat.lastVerdict === 'incorrect',
+                    'bg-warning text-dark': chat.lastVerdict === 'timeout'
+                  }">{{ ratio }}</span>
+          </span>
+        </div>
+        <app-chat-pane
+          [numQueries]="0"
+          [paneLog]="chat.paneLog"
+          [correctMessageOrdinals]="chat.correctOrdinals"
+          (removeRoom)="onPaneClosed(chat)"
+          id="evalchatpane{{chat.paneLog.roomID}}">
+        </app-chat-pane>
+      </div>
+    </div>
+
+    <div class="d-flex overflow-auto mt-2" style="gap: 10px;" *ngIf="chats.length > 0">
+      <button *ngFor="let chat of chats"
+              (click)="scrollTo(chat.paneLog.roomID); selectedRoomID = chat.paneLog.roomID"
+              [ngClass]="{'bg-secondary text-white': selectedRoomID === chat.paneLog.roomID}"
+              class="btn btn-light btn-sm"
+              [ngStyle]="{'text-decoration': chat.paneLog.active ? 'none' : 'line-through'}">
+        {{ chat.username }}
+      </button>
+    </div>
+  </div>
+</div>
+
+<ng-template #questionsModal let-modal>
+  <div class="modal-header">
+    <h4 class="modal-title">Questions and expected answers</h4>
+    <button type="button" class="btn-close" aria-label="Close" (click)="modal.dismiss()"></button>
+  </div>
+  <div class="modal-body">
+    <div class="table-responsive">
+      <table class="table table-sm table-striped align-middle mb-0">
+        <thead>
+        <tr>
+          <th style="width: 4rem;">#</th>
+          <th>Question</th>
+          <th>Expected answer</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr *ngFor="let item of questions">
+          <td>{{ item.index + 1 }}</td>
+          <td>{{ item.question }}</td>
+          <td>{{ item.expectedAnswer }}</td>
+        </tr>
+        <tr *ngIf="questions.length === 0">
+          <td colspan="3" class="text-muted">No questions loaded.</td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-outline-secondary" (click)="modal.close()">Close</button>
+  </div>
+</ng-template>
+
+<ng-template #resultModal let-modal>
+  <div class="modal-header">
+    <h4 class="modal-title">Evaluation results</h4>
+    <button type="button" class="btn-close" aria-label="Close" (click)="modal.dismiss()"></button>
+  </div>
+  <div class="modal-body">
+    <p class="text-muted small mb-2">
+      Grade: 1 point per correct answer. +0.2 if the answer is correct and under 3s, or if any reply is under 0.2s even when incorrect.
+    </p>
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-0">Summary</h6>
+      <button type="button" class="btn btn-sm btn-outline-primary" [disabled]="!canDownloadSummary" (click)="downloadSummary()">
+        <i class="fa fa-download me-1"></i>
+        <span *ngIf="!downloadingSummary">Download Summary</span>
+        <span *ngIf="downloadingSummary">Downloading...</span>
+      </button>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-striped align-middle">
+        <thead>
+        <tr>
+          <th>Chat</th>
+          <th *ngFor="let item of questions">Q{{ item.index + 1 }}</th>
+          <th>Average</th>
+          <th>Fastest</th>
+          <th>Longest</th>
+          <th>Grade</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr *ngFor="let row of chatScoreRows">
+          <td class="fw-medium">{{ row.username }}</td>
+          <td *ngFor="let answer of row.answers">
+            <div>
+              <span *ngIf="answer.verdict === 'correct'" class="badge bg-success">correct</span>
+              <span *ngIf="answer.verdict === 'incorrect'" class="badge bg-danger">incorrect</span>
+              <span *ngIf="answer.verdict === 'timeout'" class="badge bg-warning text-dark">timeout</span>
+              <span *ngIf="answer.verdict === null" class="text-muted">—</span>
+            </div>
+            <div class="small text-muted" *ngIf="answer.timeMs != null">{{ formatResponseTime(answer.timeMs) }}</div>
+            <div class="small text-success" *ngIf="answer.fastBonus">+0.2</div>
+          </td>
+          <td>{{ formatResponseTime(row.avgMs) }}</td>
+          <td>{{ formatTimedQuestion(row.fastestMs, row.fastestQuestion) }}</td>
+          <td>{{ formatTimedQuestion(row.longestMs, row.longestQuestion) }}</td>
+          <td class="fw-bold">{{ formatGrade(row.grade) }}</td>
+        </tr>
+        <tr *ngIf="chatScoreRows.length === 0">
+          <td [attr.colspan]="questions.length + 5" class="text-muted">No chat results yet.</td>
+        </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h6 class="mt-3">Logs</h6>
+    <div class="eval-log-tabs btn-group mb-2" role="group" *ngIf="chats.length > 0">
+      <button *ngFor="let chat of chats"
+              type="button"
+              class="btn btn-sm"
+              [ngClass]="activeLogRoomId === chat.paneLog.roomID ? 'btn-dark' : 'btn-outline-dark'"
+              (click)="selectLogChat(chat.paneLog.roomID)">
+        {{ chat.username }}
+      </button>
+    </div>
+    <div class="eval-log border rounded p-2">
+      <div *ngFor="let entry of filteredLogs" class="mb-1">
+        <span class="text-muted">{{ entry.time | date:'HH:mm:ss' }}</span>
+        <span class="ms-2" [ngClass]="{
+          'text-success': entry.level === 'success',
+          'text-warning': entry.level === 'warning',
+          'text-danger': entry.level === 'danger'
+        }">{{ entry.message }}</span>
+      </div>
+      <div *ngIf="filteredLogs.length === 0" class="text-muted">No logs for this chat yet.</div>
+    </div>
+  </div>
+  <div class="modal-footer">
+    <button type="button" class="btn btn-outline-primary" [disabled]="!canDownloadSummary" (click)="downloadSummary()">
+      <i class="fa fa-table me-1"></i>
+      <span *ngIf="!downloadingSummary">Download Summary</span>
+      <span *ngIf="downloadingSummary">Downloading...</span>
+    </button>
+    <button type="button" class="btn btn-outline-primary" [disabled]="!canDownloadChats" (click)="downloadChats()">
+      <i class="fa fa-download me-1"></i>
+      <span *ngIf="!downloadingChats">Download Chats</span>
+      <span *ngIf="downloadingChats">Downloading...</span>
+    </button>
+    <button type="button" class="btn btn-outline-secondary" (click)="modal.close()">Close</button>
+  </div>
+</ng-template>

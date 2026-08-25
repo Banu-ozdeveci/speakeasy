@@ -14,3 +14,7 @@
 .increase-popover-width {
   max-width: 1000px;
 }
+
+.eval-result-modal .modal-dialog {
+  max-width: min(1400px, 96vw);
+}

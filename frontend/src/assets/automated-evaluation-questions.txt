@@ -1,0 +1,11 @@
+1. Who directed ‘Titanic’?
+2. Who directed ‘Inception’?
+3. When did the movie ‘The Matrix’ come out?
+4. Who directed ‘Jurassic Park’?
+5. Who played the main character in ‘Forrest Gump’?
+
+1. James Cameron
+2. Christopher Nolan
+3. 1999-03-31
+4. Steven Spielberg
+5. Tom Hanks

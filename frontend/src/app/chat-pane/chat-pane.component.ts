@@ -45,6 +45,7 @@ export class ChatPaneComponent implements OnInit {
 
   @Input() paneLog!: PaneLog
   @Input() numQueries!: number
+  @Input() correctMessageOrdinals: number[] | null = null
 
   @Output("removeRoom") removeRoom: EventEmitter<any> = new EventEmitter()
 
@@ -216,7 +217,11 @@ export class ChatPaneComponent implements OnInit {
     }
   }
 
-// when the user wants to start rating
+  isEvaluationCorrect(ordinal: number): boolean {
+    return !!this.correctMessageOrdinals && this.correctMessageOrdinals.indexOf(ordinal) !== -1;
+  }
+
+  // when the user wants to start rating
   rating(): void {
     let questionsAsked = 0
     for (let i = 0; i < this.paneLog.ordinals; i++) {
@@ -323,6 +328,19 @@ export class ChatPaneComponent implements OnInit {
     document.removeEventListener('visibilitychange', this.visibilityChangeHandler);
     if (this.chatTimer) {
       clearInterval(this.chatTimer);
+    }
+  }
+
+  markClosed(): void {
+    this.remainingTime = 0;
+    this.lastUpdateRemainingTime = Date.now();
+    this.paneLog.active = false;
+    if (this.chatTimer) {
+      clearInterval(this.chatTimer);
+      this.chatTimer = null;
+    }
+    if (this.chatMessagesSubscription) {
+      this.chatMessagesSubscription.unsubscribe();
     }
   }
 

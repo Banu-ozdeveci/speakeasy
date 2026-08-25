@@ -1,0 +1,42 @@
+.eval-page {
+  min-height: calc(100vh - 16px);
+}
+
+.eval-chats {
+  flex-wrap: nowrap;
+  gap: 10px;
+  min-height: 560px;
+}
+
+.eval-chat-col {
+  min-width: 380px;
+  max-width: 380px;
+}
+
+.eval-log {
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 0.85rem;
+  background: #f8f9fa;
+}
+
+.eval-stat-card {
+  min-width: 120px;
+}
+
+.credentials-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.input-group .credentials-input {
+  min-width: 0;
+}
+
+.eval-chat-col .badge {
+  font-weight: 600;
+}
+
+.eval-log-tabs .btn {
+  min-width: 5.5rem;
+  font-weight: 600;
+}
