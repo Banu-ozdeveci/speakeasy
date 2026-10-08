@@ -104,6 +104,9 @@ object RestApi {
             PutFormHandler(),
             DeleteFormHandler(),
             GetAutomatedEvaluationQuestionsHandler(),
+            PostAutomatedEvaluationCredentialsCheckHandler(),
+            GetAutomatedEvaluationEmailStatusHandler(),
+            PostAutomatedEvaluationEmailsHandler(),
         )
 
         javalin = Javalin.create {

@@ -1,29 +1,66 @@
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {ChangeDetectorRef, Component, Inject, OnDestroy, OnInit, QueryList, TemplateRef, ViewChild, ViewChildren} from '@angular/core';
 import {UntypedFormControl} from '@angular/forms';
 import {Title} from '@angular/platform-browser';
 import {Router} from '@angular/router';
-import {NgbModal} from '@ng-bootstrap/ng-bootstrap';
+import {NgbModal, NgbPopover} from '@ng-bootstrap/ng-bootstrap';
 import {filter, map, take, timeout} from 'rxjs/operators';
-import {ChatRequest, ChatRoomInfo, ChatService} from '../../../openapi';
+import {AdminService, ChatRequest, ChatRoomInfo, ChatService} from '../../../openapi';
 import {AlertService} from '../alert';
+import {AppConfig} from '../app.config';
 import {AuthService} from '../authentication.service';
 import {CommonService} from '../common.service';
 import {PaneLog} from '../new_data';
 import {ChatPaneComponent} from '../chat-pane/chat-pane.component';
-import {answersMatch, EvaluationQuestion, parseQuestionsFile} from './questions-parser';
+import {AnswerVerdict, EvaluationQuestion, expectedAnswersLabel, parseQuestionsFile, scoreAnswer} from './questions-parser';
+import {createSummaryExcelBlob} from './excel-summary';
+import {
+  copyGradingSettings,
+  DEFAULT_GRADING_SETTINGS,
+  formatBonusPoints,
+  GradingSettings,
+  sanitizeGradingSettings,
+  speedBonusPoints,
+  speedBonusRulesText
+} from './grading-settings';
 import {createZipBlob} from './zip-store';
+import {EmailRecipientMap, parseEmailRecipients, recipientsFor} from './email-recipients';
+
+interface EmailSendResult {
+  username: string
+  email: string
+  sent: boolean
+  error?: string | null
+}
+
+interface EmailSendResponse {
+  sent: number
+  failed: number
+  results: EmailSendResult[]
+}
+
+interface EmailStatus {
+  configured: boolean
+  host?: string | null
+  from?: string | null
+}
 
 interface BotCredential {
   username: string
   password: string
 }
 
+interface CredentialCheckResult {
+  username: string
+  ok: boolean
+  reason?: string | null
+}
+
 interface EvalChat {
   username: string
   password: string
   paneLog: PaneLog
-  lastVerdict: 'correct' | 'incorrect' | 'timeout' | null
+  lastVerdict: 'correct' | 'partial' | 'incorrect' | 'timeout' | null
   lastResponseMs: number | null
   correctOrdinals: number[]
 }
@@ -36,6 +73,7 @@ interface EvaluationResult {
   expected: string
   answer: string
   correct: boolean
+  partial: boolean
   timedOut: boolean
   responseTimeMs: number | null
 }
@@ -46,6 +84,7 @@ interface ChatRanking {
   roomId: string
   correct: number
   incorrect: number
+  partial: number
   timeouts: number
   total: number
   accuracy: number
@@ -55,9 +94,9 @@ interface ChatRanking {
 }
 
 interface QuestionScore {
-  verdict: 'correct' | 'incorrect' | 'timeout' | null
+  verdict: 'correct' | 'partial' | 'incorrect' | 'timeout' | null
   timeMs: number | null
-  fastBonus: boolean
+  fastBonusPoints: number
 }
 
 interface ChatScoreRow {
@@ -91,19 +130,29 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     keepAfterRouteChange: true
   };
 
-  @ViewChild('resultModal') resultModal!: TemplateRef<any>;
-  @ViewChild('questionsModal') questionsModal!: TemplateRef<any>;
+  @ViewChild('resultModal') resultModal!: TemplateRef<unknown>;
+  @ViewChild('questionsModal') questionsModal!: TemplateRef<unknown>;
+  @ViewChild('settingsModal') settingsModal!: TemplateRef<unknown>;
   @ViewChildren(ChatPaneComponent) chatPanes!: QueryList<ChatPaneComponent>;
 
   credentialsInput = new UntypedFormControl('');
+  credentialSummary = '';
+  credentialIssueGroups: {title: string, usernames: string[]}[] = [];
   chats: EvalChat[] = [];
   questions: EvaluationQuestion[] = [];
+  questionsFileName = '';
+  recipientsFileName = '';
+  emailRecipients: EmailRecipientMap = {};
+  emailConfigured: boolean | null = null;
+  sendingMail = false;
+  logsSentConfirm = false;
+  grading: GradingSettings = copyGradingSettings(DEFAULT_GRADING_SETTINGS);
+  gradingDraft: GradingSettings = copyGradingSettings(DEFAULT_GRADING_SETTINGS);
   results: EvaluationResult[] = [];
   logs: EvaluationLogEntry[] = [];
 
   startingChats = false;
   askingQuestions = false;
-  closingChats = false;
   downloadingChats = false;
   downloadingSummary = false;
   finishing = false;
@@ -112,12 +161,19 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
   selectedLogChat = '';
 
   private stopAsking = false;
-  private readonly answerTimeoutMs = 45000;
+  private sessionId = 0;
   private readonly roomTimeoutMs = 15000;
-  private readonly correctPoints = 1;
-  private readonly fastBonusPoints = 0.2;
-  private readonly fastThresholdMs = 3000;
-  private readonly ultraFastThresholdMs = 200;
+  private recipientsHelpPopover: NgbPopover | null = null;
+  private recipientsHelpCloseTimer: ReturnType<typeof setTimeout> | null = null;
+  private recipientsHelpWindowEl: HTMLElement | null = null;
+  private recipientsHelpEnter: (() => void) | null = null;
+  private recipientsHelpLeave: (() => void) | null = null;
+  private logsSentTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly appConfig = new AppConfig();
+
+  get answerTimeoutMs(): number {
+    return Math.max(1, this.grading.timeoutSeconds) * 1000;
+  }
 
   constructor(
     private router: Router,
@@ -126,6 +182,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     private authService: AuthService,
     @Inject(CommonService) private commonService: CommonService,
     @Inject(ChatService) private chatService: ChatService,
+    @Inject(AdminService) private adminService: AdminService,
     public alertService: AlertService,
     private modalService: NgbModal,
     private changeDetector: ChangeDetectorRef
@@ -145,7 +202,68 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     });
 
     this.commonService.openSseAndListenRooms(false);
-    this.loadQuestions();
+    this.refreshEmailStatus();
+  }
+
+  get scoringRulesText(): string {
+    return `Correct ${this.grading.correctPoints}, partial ${this.grading.partialPoints}. Speed: ${speedBonusRulesText(this.grading)}. Timeout ${this.grading.timeoutSeconds}s.`;
+  }
+
+  get canEditSettings(): boolean {
+    return !this.askingQuestions;
+  }
+
+  openSettings(): void {
+    this.gradingDraft = copyGradingSettings(this.grading);
+    this.modalService.open(this.settingsModal, {centered: true, size: 'lg'});
+  }
+
+  saveSettings(modal: {close: () => void}): void {
+    this.grading = sanitizeGradingSettings(this.gradingDraft);
+    this.log('info', `Grading settings saved. ${this.scoringRulesText}`);
+    this.alertService.success('Grading settings saved.', this.options);
+    modal.close();
+  }
+
+  resetSettingsDraft(): void {
+    this.gradingDraft = copyGradingSettings(DEFAULT_GRADING_SETTINGS);
+  }
+
+  resetEvaluation(): void {
+    this.sessionId += 1;
+    this.stopAsking = true;
+    this.modalService.dismissAll();
+    this.chats.filter(chat => chat.paneLog.active).forEach(chat => {
+      this.chatService.patchApiRoomByRoomId(chat.paneLog.roomID, undefined).toPromise().catch(() => undefined);
+      this.markEvalChatClosed(chat);
+    });
+    this.credentialsInput.setValue('');
+    this.credentialSummary = '';
+    this.credentialIssueGroups = [];
+    this.chats = [];
+    this.questions = [];
+    this.questionsFileName = '';
+    this.recipientsFileName = '';
+    this.emailRecipients = {};
+    this.grading = copyGradingSettings(DEFAULT_GRADING_SETTINGS);
+    this.gradingDraft = copyGradingSettings(DEFAULT_GRADING_SETTINGS);
+    this.results = [];
+    this.logs = [];
+    this.startingChats = false;
+    this.askingQuestions = false;
+    this.downloadingChats = false;
+    this.downloadingSummary = false;
+    this.finishing = false;
+    this.sendingMail = false;
+    this.logsSentConfirm = false;
+    this.clearLogsSentTimer();
+    this.cancelRecipientsHelpClose();
+    this.unbindRecipientsHelpWindow();
+    this.currentQuestionLabel = '';
+    this.selectedRoomID = '';
+    this.selectedLogChat = '';
+    this.alertService.success('Evaluation reset.', this.options);
+    this.changeDetector.detectChanges();
   }
 
   get canStartChats(): boolean {
@@ -164,16 +282,72 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     return this.questions.length > 0;
   }
 
-  get canCloseChats(): boolean {
-    return !this.startingChats && !this.closingChats && this.hasActiveChats;
-  }
-
   get canDownloadChats(): boolean {
     return !this.downloadingChats && this.chats.length > 0;
   }
 
   get canDownloadSummary(): boolean {
     return !this.downloadingSummary && this.chatScoreRows.length > 0;
+  }
+
+  get recipientCount(): number {
+    return Object.keys(this.emailRecipients).length;
+  }
+
+  get recipientRows(): {username: string, emails: string[]}[] {
+    return Object.keys(this.emailRecipients)
+      .sort((a, b) => a.localeCompare(b))
+      .map(username => ({username, emails: this.emailRecipients[username]}));
+  }
+
+  get canSendLogs(): boolean {
+    return !this.sendingMail && !this.logsSentConfirm && this.chats.length > 0 && this.recipientCount > 0;
+  }
+
+  openRecipientsHelp(popover: NgbPopover): void {
+    this.recipientsHelpPopover = popover;
+    this.cancelRecipientsHelpClose();
+    if (!popover.isOpen()) {
+      popover.open();
+    }
+  }
+
+  scheduleCloseRecipientsHelp(): void {
+    this.cancelRecipientsHelpClose();
+    this.recipientsHelpCloseTimer = setTimeout(() => {
+      this.recipientsHelpPopover?.close();
+    }, 250);
+  }
+
+  bindRecipientsHelpWindow(): void {
+    this.unbindRecipientsHelpWindow();
+    const el = document.querySelector('ngb-popover-window.eval-hover-stay') as HTMLElement | null;
+    if (!el) {
+      return;
+    }
+    this.recipientsHelpWindowEl = el;
+    this.recipientsHelpEnter = () => this.cancelRecipientsHelpClose();
+    this.recipientsHelpLeave = () => this.scheduleCloseRecipientsHelp();
+    el.addEventListener('mouseenter', this.recipientsHelpEnter);
+    el.addEventListener('mouseleave', this.recipientsHelpLeave);
+  }
+
+  unbindRecipientsHelpWindow(): void {
+    if (this.recipientsHelpWindowEl && this.recipientsHelpEnter && this.recipientsHelpLeave) {
+      this.recipientsHelpWindowEl.removeEventListener('mouseenter', this.recipientsHelpEnter);
+      this.recipientsHelpWindowEl.removeEventListener('mouseleave', this.recipientsHelpLeave);
+    }
+    this.recipientsHelpWindowEl = null;
+    this.recipientsHelpEnter = null;
+    this.recipientsHelpLeave = null;
+  }
+
+  get finishedChatCount(): number {
+    return this.chats.filter(chat => this.isChatFinished(chat)).length;
+  }
+
+  get remainingChatCount(): number {
+    return Math.max(0, this.chats.length - this.finishedChatCount);
   }
 
   get filteredLogs(): EvaluationLogEntry[] {
@@ -223,16 +397,20 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
         answers: this.questions.map(question => {
           const result = byQuestion.get(question.index);
           if (!result) {
-            return {verdict: null, timeMs: null, fastBonus: false};
+            return {verdict: null, timeMs: null, fastBonusPoints: 0};
           }
-          let verdict: QuestionScore['verdict'] = result.correct ? 'correct' : 'incorrect';
+          let verdict: QuestionScore['verdict'] = 'incorrect';
           if (result.timedOut) {
             verdict = 'timeout';
+          } else if (result.correct) {
+            verdict = 'correct';
+          } else if (result.partial) {
+            verdict = 'partial';
           }
           return {
             verdict,
             timeMs: result.responseTimeMs,
-            fastBonus: this.hasFastBonus(result)
+            fastBonusPoints: this.bonusForResult(result)
           };
         }),
         avgMs: this.averageTime(chatResults),
@@ -258,7 +436,11 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
   }
 
   get totalIncorrect(): number {
-    return this.results.filter(r => !r.correct && !r.timedOut).length;
+    return this.results.filter(r => !r.correct && !r.partial && !r.timedOut).length;
+  }
+
+  get totalPartial(): number {
+    return this.results.filter(r => r.partial).length;
   }
 
   get totalTimeouts(): number {
@@ -283,6 +465,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
         .filter(r => !r.timedOut && r.responseTimeMs != null)
         .map(r => r.responseTimeMs as number);
       const correct = chatResults.filter(r => r.correct).length;
+      const partial = chatResults.filter(r => r.partial).length;
       const timeouts = chatResults.filter(r => r.timedOut).length;
       const total = chatResults.length;
       return {
@@ -290,7 +473,8 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
         username: chat.username,
         roomId: chat.paneLog.roomID,
         correct,
-        incorrect: chatResults.filter(r => !r.correct && !r.timedOut).length,
+        partial,
+        incorrect: chatResults.filter(r => !r.correct && !r.partial && !r.timedOut).length,
         timeouts,
         total,
         accuracy: total === 0 ? 0 : Math.round((correct / total) * 100),
@@ -375,6 +559,188 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     return `${correct}/${chatResults.length}`;
   }
 
+  importQuestionsFile(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) {
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = parseQuestionsFile(String(reader.result || ''));
+        this.questions = parsed;
+        this.questionsFileName = file.name;
+        this.log('success', `Loaded ${parsed.length} question${parsed.length === 1 ? '' : 's'} from ${file.name}.`);
+        this.alertService.success(`Loaded ${parsed.length} question${parsed.length === 1 ? '' : 's'} from ${file.name}.`, this.options);
+        this.changeDetector.detectChanges();
+      } catch (error: unknown) {
+        this.alertService.error(this.errorMessage(error, 'Could not parse the questions file.'), this.options);
+      }
+    };
+    reader.onerror = () => {
+      this.alertService.error('Could not read the questions file.', this.options);
+    };
+    reader.readAsText(file);
+  }
+
+  clearQuestions(): void {
+    if (this.askingQuestions) {
+      return;
+    }
+    const name = this.questionsFileName;
+    this.questions = [];
+    this.questionsFileName = '';
+    this.log('info', name ? `Removed questions file ${name}.` : 'Removed loaded questions.');
+    this.changeDetector.detectChanges();
+  }
+
+  importRecipientsFile(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) {
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = parseEmailRecipients(String(reader.result || ''));
+        this.emailRecipients = parsed.mapping;
+        this.recipientsFileName = file.name;
+        const chats = this.recipientCount;
+        const addresses = Object.values(parsed.mapping).reduce((sum, emails) => sum + emails.length, 0);
+        this.log('success', `Loaded recipients for ${chats} chat${chats === 1 ? '' : 's'} (${addresses} address${addresses === 1 ? '' : 'es'}) from ${file.name}.`);
+        if (parsed.invalidEmails.length > 0) {
+          this.alertService.warn(`Loaded ${chats} chat${chats === 1 ? '' : 's'}. Skipped invalid address${parsed.invalidEmails.length === 1 ? '' : 'es'}: ${parsed.invalidEmails.join(', ')}.`, {
+            ...this.options,
+            timeout: 12000
+          });
+        } else {
+          this.alertService.success(`Loaded recipients for ${chats} chat${chats === 1 ? '' : 's'}.`, this.options);
+        }
+        this.changeDetector.detectChanges();
+      } catch (error: unknown) {
+        this.alertService.error(this.errorMessage(error, 'Could not parse the recipients file.'), this.options);
+      }
+    };
+    reader.onerror = () => {
+      this.alertService.error('Could not read the recipients file.', this.options);
+    };
+    reader.readAsText(file);
+  }
+
+  clearRecipients(): void {
+    const name = this.recipientsFileName;
+    this.emailRecipients = {};
+    this.recipientsFileName = '';
+    this.log('info', name ? `Removed recipients file ${name}.` : 'Removed loaded recipients.');
+    this.changeDetector.detectChanges();
+  }
+
+  sendLogs(): void {
+    if (!this.canSendLogs) {
+      return;
+    }
+
+    const transcripts = this.chats
+      .map(chat => ({
+        username: chat.username,
+        content: this.buildChatExport(chat),
+        recipients: recipientsFor(this.emailRecipients, chat.username)
+      }))
+      .filter(item => item.recipients.length > 0);
+
+    const missingChats = this.chats
+      .filter(chat => recipientsFor(this.emailRecipients, chat.username).length === 0)
+      .map(chat => chat.username);
+    const unusedRecipients = Object.keys(this.emailRecipients)
+      .filter(username => !this.chats.some(chat => chat.username.toLowerCase() === username.toLowerCase()));
+
+    if (transcripts.length === 0) {
+      this.alertService.warn(`No chats match the recipients file. Missing: ${missingChats.join(', ') || 'none'}.`, {
+        ...this.options,
+        timeout: 12000
+      });
+      return;
+    }
+
+    this.sendingMail = true;
+    this.http.post<EmailSendResponse>(
+      this.apiUrl('/api/automated-evaluation/emails'),
+      {transcripts},
+      {withCredentials: true}
+    ).subscribe({
+      next: response => {
+        this.sendingMail = false;
+        this.emailConfigured = true;
+        const extras = [
+          missingChats.length > 0 ? `${missingChats.length} chat${missingChats.length === 1 ? '' : 's'} had no email` : '',
+          unusedRecipients.length > 0 ? `${unusedRecipients.length} recipient name${unusedRecipients.length === 1 ? '' : 's'} had no chat` : ''
+        ].filter(part => part.length > 0);
+        if (response.failed === 0) {
+          const summary = `Sent ${response.sent} email${response.sent === 1 ? '' : 's'}.${extras.length ? ' ' + extras.join('. ') + '.' : ''}`;
+          this.log('success', summary);
+          this.alertService.success(summary, {...this.options, timeout: 12000});
+          this.showLogsSentConfirm();
+        } else {
+          const firstError = response.results.find(result => !result.sent)?.error;
+          const summary = `Sent ${response.sent}, failed ${response.failed}.${firstError ? ' ' + firstError : ''}`;
+          this.log('warning', summary);
+          this.alertService.warn(summary, {...this.options, timeout: 15000});
+        }
+        this.changeDetector.detectChanges();
+      },
+      error: (error: HttpErrorResponse) => {
+        this.sendingMail = false;
+        const message = this.httpErrorDescription(error, 'Could not send chat logs.');
+        this.log('danger', message);
+        this.alertService.error(message, this.options);
+        if (error.status === 503) {
+          this.emailConfigured = false;
+        }
+        this.changeDetector.detectChanges();
+      }
+    });
+  }
+
+  private cancelRecipientsHelpClose(): void {
+    if (this.recipientsHelpCloseTimer) {
+      clearTimeout(this.recipientsHelpCloseTimer);
+      this.recipientsHelpCloseTimer = null;
+    }
+  }
+
+  private showLogsSentConfirm(): void {
+    this.logsSentConfirm = true;
+    this.clearLogsSentTimer();
+    this.logsSentTimer = setTimeout(() => {
+      this.logsSentConfirm = false;
+      this.logsSentTimer = null;
+      this.changeDetector.detectChanges();
+    }, 3000);
+  }
+
+  private clearLogsSentTimer(): void {
+    if (this.logsSentTimer) {
+      clearTimeout(this.logsSentTimer);
+      this.logsSentTimer = null;
+    }
+  }
+
+  private refreshEmailStatus(): void {
+    this.http.get<EmailStatus>(this.apiUrl('/api/automated-evaluation/email/status'), {withCredentials: true}).subscribe({
+      next: status => {
+        this.emailConfigured = !!status?.configured;
+        this.changeDetector.detectChanges();
+      },
+      error: () => {
+        this.emailConfigured = null;
+      }
+    });
+  }
+
   startChats(): void {
     const credentials = this.parseCredentials(this.credentialsInput.value || '');
     if (credentials.length === 0) {
@@ -384,8 +750,19 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
 
     this.startingChats = true;
     this.stopAsking = false;
-    this.log('info', `Starting ${credentials.length} chat${credentials.length === 1 ? '' : 's'}...`);
-    this.createChatsSequentially(credentials).finally(() => {
+    this.checkCredentials(credentials).then(results => {
+      const valid = this.keepValidCredentials(credentials, results);
+      this.showCredentialSummary(results, valid.length > 0);
+      if (valid.length === 0) {
+        this.alertService.error(`None of the ${credentials.length} bots could be started. ${this.skippedReasonText(results)}`, {
+          ...this.options,
+          timeout: 12000
+        });
+        return;
+      }
+      this.log('info', `Starting ${valid.length} of ${credentials.length} chat${credentials.length === 1 ? '' : 's'}...`);
+      return this.createChatsSequentially(valid);
+    }).finally(() => {
       this.startingChats = false;
     });
   }
@@ -401,12 +778,23 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     reader.onload = () => {
       const credentials = this.parseImportedCredentials(String(reader.result || ''));
       if (credentials.length === 0) {
+        this.credentialSummary = '';
+        this.credentialIssueGroups = [];
         this.alertService.error('No botname-password pairs found in the file.', this.options);
         return;
       }
-      this.credentialsInput.setValue(credentials.map(cred => `${cred.username} ${cred.password}`).join(', '));
-      this.log('success', `Imported ${credentials.length} bot${credentials.length === 1 ? '' : 's'} from ${file.name}.`);
-      this.alertService.success(`Imported ${credentials.length} bot credential${credentials.length === 1 ? '' : 's'}.`, this.options);
+      this.checkCredentials(credentials).then(results => {
+        const valid = this.keepValidCredentials(credentials, results);
+        this.showCredentialSummary(results, false);
+        if (valid.length === credentials.length) {
+          this.log('success', `Imported ${valid.length} bot${valid.length === 1 ? '' : 's'} from ${file.name}.`);
+          this.alertService.success(`Imported ${valid.length} bot credential${valid.length === 1 ? '' : 's'}.`, this.options);
+          return;
+        }
+        const summary = `Kept ${valid.length} of ${credentials.length}. ${this.skippedReasonText(results)}`;
+        this.log('warning', summary);
+        this.alertService.warn(summary, {...this.options, timeout: 12000});
+      });
     };
     reader.onerror = () => {
       this.alertService.error('Could not read the text file.', this.options);
@@ -418,16 +806,14 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     if (this.startingChats || this.askingQuestions || this.chats.length === 0 || !this.hasActiveChats) {
       return;
     }
-    this.loadQuestions().then(() => {
-      if (this.questions.length === 0) {
-        this.alertService.error('No questions loaded.', this.options);
-        return;
-      }
-      this.askingQuestions = true;
-      this.stopAsking = false;
-      this.log('info', `Asking ${this.questions.length} questions in order...`);
-      return this.askNextQuestion(0);
-    }).then(() => {
+    if (this.questions.length === 0) {
+      this.alertService.error('Add a questions file first.', this.options);
+      return;
+    }
+    this.askingQuestions = true;
+    this.stopAsking = false;
+    this.log('info', `Asking ${this.questions.length} questions in order...`);
+    this.askNextQuestion(0).then(() => {
       if (!this.askingQuestions) {
         return;
       }
@@ -448,47 +834,36 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
   }
 
   seeQuestions(): void {
-    this.loadQuestions().then(() => {
-      if (this.questions.length === 0) {
-        this.alertService.error('Questions are not loaded yet.', this.options);
-        return;
-      }
-      this.modalService.open(this.questionsModal, {size: 'lg', centered: true, scrollable: true});
-    }).catch(() => {
-      this.alertService.error('Could not load automated-evaluation-questions.txt.', this.options);
-    });
-  }
-
-  closeChats(): void {
-    if (!this.canCloseChats) {
+    if (this.questions.length === 0) {
+      this.alertService.error('Add a questions file first.', this.options);
       return;
     }
-    this.stopAsking = true;
-    this.closingChats = true;
-    const activeChats = this.chats.filter(chat => chat.paneLog.active);
-    Promise.all(activeChats.map(chat =>
-      this.chatService.patchApiRoomByRoomId(chat.paneLog.roomID, undefined).toPromise()
-        .then(() => this.markEvalChatClosed(chat))
-        .catch(() => this.markEvalChatClosed(chat))
-    )).then(() => {
-      this.log('success', `Closed ${activeChats.length} chat${activeChats.length === 1 ? '' : 's'}.`);
-      this.alertService.success('Chats closed.', this.options);
-      this.changeDetector.detectChanges();
-    }).finally(() => {
-      this.closingChats = false;
-      this.changeDetector.detectChanges();
-    });
+    this.modalService.open(this.questionsModal, {size: 'lg', centered: true, scrollable: true});
   }
 
   onPaneClosed(chat: EvalChat): void {
     this.markEvalChatClosed(chat);
+    this.chats = this.chats.filter(item => item.paneLog.roomID !== chat.paneLog.roomID);
+    if (this.selectedRoomID === chat.paneLog.roomID) {
+      this.selectedRoomID = this.chats[0]?.paneLog.roomID || '';
+    }
+    if (this.selectedLogChat === chat.paneLog.roomID) {
+      this.selectedLogChat = this.chats[0]?.paneLog.roomID || '';
+    }
+    this.log('info', `Closed chat with ${chat.username}.`, chat.username, chat.paneLog.roomID);
     this.changeDetector.detectChanges();
   }
 
   private markEvalChatClosed(chat: EvalChat): void {
     chat.paneLog.active = false;
-    const pane = this.chatPanes?.find(item => item.paneLog.roomID === chat.paneLog.roomID);
-    pane?.markClosed();
+    const panes = this.chatPanes ? this.chatPanes.toArray() : [];
+    const pane = panes.find(item => item.paneLog.roomID === chat.paneLog.roomID)
+      || panes.find(item => item.paneLog === chat.paneLog);
+    if (pane) {
+      pane.markClosed();
+    } else {
+      panes.filter(item => item.paneLog.roomID === chat.paneLog.roomID).forEach(item => item.markClosed());
+    }
   }
 
   finishEvaluation(): void {
@@ -545,7 +920,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     this.downloadingSummary = true;
     try {
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-      this.triggerDownload(`automated-evaluation-summary-${stamp}.pdf`, this.buildSummaryPdf());
+      this.triggerDownload(`automated-evaluation-summary-${stamp}.xlsx`, this.buildSummaryExcel());
     } catch (error) {
       this.alertService.error('Could not download the summary.', this.options);
     } finally {
@@ -562,23 +937,13 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.stopAsking = true;
+    this.clearLogsSentTimer();
+    this.cancelRecipientsHelpClose();
+    this.unbindRecipientsHelpWindow();
   }
 
-  private loadQuestions(): Promise<void> {
-    const url = `/api/automated-evaluation/questions?t=${Date.now()}`;
-    return this.http.get(url, {responseType: 'text', withCredentials: true}).toPromise()
-      .catch(() => this.http.get(`/assets/automated-evaluation-questions.txt?t=${Date.now()}`, {responseType: 'text'}).toPromise())
-      .then((raw) => {
-        if (!raw) {
-          throw new Error('The questions file is empty.');
-        }
-        this.questions = parseQuestionsFile(raw);
-        this.log('info', `Loaded ${this.questions.length} questions from automated-evaluation-questions.txt.`);
-      })
-      .catch((error) => {
-        this.alertService.error(error.message || 'Could not load automated-evaluation-questions.txt.', this.options);
-        throw error;
-      });
+  expectedAnswersLabel(item: EvaluationQuestion): string {
+    return expectedAnswersLabel(item);
   }
 
   private parseCredentials(raw: string): BotCredential[] {
@@ -600,10 +965,22 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
   }
 
   private parseImportedCredentials(raw: string): BotCredential[] {
-    return raw
-      .split(/[\n,]/)
+    const normalized = raw
+      .replace(/^\uFEFF/, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('#'))
+      .join(',');
+    const spaced = this.parseCredentials(normalized);
+    if (spaced.length > 0) {
+      return spaced;
+    }
+    return normalized
+      .split(',')
       .map(part => part.trim())
-      .filter(part => part.length > 0 && !part.startsWith('#'))
+      .filter(part => part.length > 0)
       .map(part => {
         const separator = part.indexOf('-');
         if (separator <= 0 || separator === part.length - 1) {
@@ -617,31 +994,154 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
       .filter(cred => cred.username.length > 0 && cred.password.length > 0);
   }
 
+  private apiUrl(path: string): string {
+    return `${this.appConfig.basePath}${path}`;
+  }
+
+  private checkCredentials(credentials: BotCredential[]): Promise<CredentialCheckResult[]> {
+    return this.http.post<CredentialCheckResult[]>(
+      this.apiUrl('/api/automated-evaluation/credentials/check'),
+      {credentials},
+      {withCredentials: true}
+    ).toPromise()
+      .then(results => {
+        if (!results || results.length !== credentials.length) {
+          throw new Error('Credential check returned an unexpected result.');
+        }
+        return results;
+      })
+      .catch(() => this.checkCredentialsFallback(credentials));
+  }
+
+  private checkCredentialsFallback(credentials: BotCredential[]): Promise<CredentialCheckResult[]> {
+    return Promise.all([
+      this.adminService.getApiUserList().toPromise(),
+      this.adminService.getApiUserSessions().toPromise()
+    ]).then(([users, sessions]) => {
+      const known = new Set((users || []).map(user => user.username));
+      const online = new Set((sessions || []).map(session => session.userDetails.username));
+      return credentials.map(credential => {
+        if (!known.has(credential.username)) {
+          return {username: credential.username, ok: false, reason: 'does_not_exist'};
+        }
+        if (!online.has(credential.username)) {
+          return {username: credential.username, ok: false, reason: 'not_logged_in'};
+        }
+        return {username: credential.username, ok: true};
+      });
+    }).catch(() => credentials.map(credential => ({username: credential.username, ok: true})));
+  }
+
+  private keepValidCredentials(credentials: BotCredential[], results: CredentialCheckResult[]): BotCredential[] {
+    const valid = credentials.filter((_, index) => results[index]?.ok);
+    this.credentialsInput.setValue(valid.map(cred => `${cred.username} ${cred.password}`).join(', '));
+    return valid;
+  }
+
+  private showCredentialSummary(results: CredentialCheckResult[], toast = true): void {
+    const failed = results.filter(result => !result.ok);
+    const kept = results.length - failed.length;
+    this.credentialIssueGroups = this.buildCredentialIssueGroups(results);
+    this.credentialSummary = failed.length === 0
+      ? ''
+      : `Kept ${kept} of ${results.length}. ${this.skippedReasonText(results)}`;
+    failed.forEach(result => this.log('warning', this.credentialIssueMessage(result), result.username));
+    if (toast && this.credentialSummary) {
+      this.alertService.warn(this.credentialSummary, {...this.options, timeout: 12000});
+    }
+    this.changeDetector.detectChanges();
+  }
+
+  private buildCredentialIssueGroups(results: CredentialCheckResult[]): {title: string, usernames: string[]}[] {
+    return [
+      {reason: 'not_logged_in', title: 'Inactive'},
+      {reason: 'does_not_exist', title: 'Does not exist'},
+      {reason: 'wrong_password', title: 'Wrong password'}
+    ]
+      .map(group => ({
+        title: group.title,
+        usernames: [...new Set(results
+          .filter(result => !result.ok && (result.reason || 'other') === group.reason)
+          .map(result => result.username))]
+      }))
+      .filter(group => group.usernames.length > 0);
+  }
+
+  private skippedReasonText(results: CredentialCheckResult[]): string {
+    const counts = new Map<string, number>();
+    results.filter(result => !result.ok).forEach(result => {
+      const key = result.reason || 'other';
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    const parts = [
+      this.countLabel(counts.get('not_logged_in') || 0, 'not logged in', 'not logged in'),
+      this.countLabel(counts.get('does_not_exist') || 0, 'does not exist', 'do not exist'),
+      this.countLabel(counts.get('wrong_password') || 0, 'wrong password', 'wrong password'),
+      this.countLabel(counts.get('other') || 0, 'cannot be used', 'cannot be used')
+    ].filter(part => part.length > 0);
+    return parts.length > 0 ? `Skipped: ${parts.join(', ')}.` : '';
+  }
+
+  private countLabel(count: number, singular: string, plural: string): string {
+    if (count <= 0) {
+      return '';
+    }
+    return `${count} ${count === 1 ? singular : plural}`;
+  }
+
+  private credentialIssueMessage(result: CredentialCheckResult): string {
+    if (result.reason === 'does_not_exist') {
+      return `User ${result.username} does not exist.`;
+    }
+    if (result.reason === 'wrong_password') {
+      return `User ${result.username} has the wrong password.`;
+    }
+    if (result.reason === 'not_logged_in') {
+      return `User ${result.username} is not logged in.`;
+    }
+    return `User ${result.username} cannot be used.`;
+  }
+
   private async createChatsSequentially(credentials: BotCredential[]): Promise<void> {
+    const session = this.sessionId;
     for (const credential of credentials) {
+      if (session !== this.sessionId) {
+        return;
+      }
       try {
         const knownIds = await this.snapshotRoomIds();
         await this.chatService.postApiRoomsRequest({
           username: credential.username,
           formName: '',
           automatedEvaluation: true
-        } as ChatRequest).toPromise();
+        } as ChatRequest & {automatedEvaluation: boolean}).toPromise();
         const room = await this.waitForNewRoom(knownIds);
+        if (session !== this.sessionId) {
+          this.chatService.patchApiRoomByRoomId(room.uid, undefined).toPromise().catch(() => undefined);
+          return;
+        }
         this.addChat(room, credential);
-      } catch (error: any) {
-        if (error?.status === 404) {
+      } catch (error: unknown) {
+        if (session !== this.sessionId) {
+          return;
+        }
+        const status = this.httpStatus(error);
+        if (status === 404) {
           this.log('danger', `User ${credential.username} does not exist.`, credential.username);
           this.alertService.error(`User ${credential.username} does not exist.`, this.options);
-        } else if (error?.status === 403) {
+        } else if (status === 403) {
           this.log('danger', 'Cannot start a chat while an assignment round is running.');
           this.alertService.error('Cannot start a chat while an assignment round is running.', this.options);
-        } else if (error?.name === 'TimeoutError') {
+        } else if (this.errorName(error) === 'TimeoutError') {
           this.log('danger', `Timed out waiting for a room with ${credential.username}.`, credential.username);
         } else {
           this.log('danger', `Could not start a chat with ${credential.username}.`, credential.username);
           this.alertService.error(`Could not start a chat with ${credential.username}.`, this.options);
         }
       }
+    }
+    if (session !== this.sessionId) {
+      return;
     }
     this.log('success', `Started ${this.chats.length} chat${this.chats.length === 1 ? '' : 's'}.`);
     if (this.chats.length > 0) {
@@ -659,8 +1159,8 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
 
   private waitForNewRoom(knownIds: Set<string>): Promise<ChatRoomInfo> {
     return this.commonService.Rooms.pipe(
-      filter(list => !!list && list.rooms.some(room => !knownIds.has(room.uid))),
-      map(list => list!.rooms.find(room => !knownIds.has(room.uid))!),
+      map(list => list?.rooms.find(room => !knownIds.has(room.uid))),
+      filter((room): room is ChatRoomInfo => !!room),
       take(1),
       timeout(this.roomTimeoutMs)
     ).toPromise() as Promise<ChatRoomInfo>;
@@ -708,9 +1208,9 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
       return;
     }
     const item = this.questions[questionIndex];
-    this.currentQuestionLabel = `Q${item.index + 1}: ${item.question}`;
+    this.currentQuestionLabel = `Q${item.index + 1}: ${this.shorten(item.question)}`;
     this.chats.forEach(chat => {
-      this.log('info', `Sending question ${item.index + 1}: ${item.question}`, chat.username, chat.paneLog.roomID);
+      this.log('info', `Sending question ${item.index + 1}: ${this.shorten(item.question)}`, chat.username, chat.paneLog.roomID);
     });
 
     await Promise.all(this.chats.map(chat => this.askChatQuestion(chat, item)));
@@ -722,7 +1222,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
       return;
     }
     if (!chat.paneLog.active) {
-      this.recordResult(chat, item, '', false, true, null);
+      this.recordResult(chat, item, '', 'timeout', null);
       this.log('warning', `${chat.username}: room is no longer active, skipped question ${item.index + 1}.`, chat.username, chat.paneLog.roomID);
       return;
     }
@@ -731,7 +1231,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     try {
       await this.chatService.postApiRoomByRoomId(chat.paneLog.roomID, undefined, '', item.question).toPromise();
     } catch (error) {
-      this.recordResult(chat, item, '', false, true, null);
+      this.recordResult(chat, item, '', 'timeout', null);
       this.log('danger', `${chat.username}: failed to send question ${item.index + 1}.`, chat.username, chat.paneLog.roomID);
       return;
     }
@@ -740,19 +1240,19 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     try {
       const reply = await this.waitForReply(chat, beforeOrdinal);
       const responseTimeMs = Date.now() - startedAt;
-      const correct = answersMatch(item.expectedAnswer, reply.message);
-      this.recordResult(chat, item, reply.message, correct, false, responseTimeMs);
-      chat.lastVerdict = correct ? 'correct' : 'incorrect';
+      const verdict = scoreAnswer(item.expectedAnswers, reply.message);
+      this.recordResult(chat, item, reply.message, verdict, responseTimeMs);
+      chat.lastVerdict = verdict;
       chat.lastResponseMs = responseTimeMs;
-      if (correct) {
+      if (verdict === 'correct') {
         chat.correctOrdinals = chat.correctOrdinals.concat(reply.ordinal);
       }
-      this.log(correct ? 'success' : 'warning',
-        `${chat.username} Q${item.index + 1}: ${correct ? 'correct' : 'incorrect'} in ${this.formatResponseTime(responseTimeMs)} — "${this.shorten(reply.message)}"`,
+      this.log(verdict === 'incorrect' ? 'warning' : 'success',
+        `${chat.username} Q${item.index + 1}: ${verdict} in ${this.formatResponseTime(responseTimeMs)} — "${this.shorten(reply.message)}"`,
         chat.username, chat.paneLog.roomID);
     } catch (error) {
       const responseTimeMs = Date.now() - startedAt;
-      this.recordResult(chat, item, '', false, true, responseTimeMs);
+      this.recordResult(chat, item, '', 'timeout', responseTimeMs);
       chat.lastVerdict = 'timeout';
       chat.lastResponseMs = responseTimeMs;
       this.log('warning', `${chat.username} Q${item.index + 1}: no answer within ${this.formatResponseTime(responseTimeMs)}.`, chat.username, chat.paneLog.roomID);
@@ -794,8 +1294,7 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     chat: EvalChat,
     item: EvaluationQuestion,
     answer: string,
-    correct: boolean,
-    timedOut: boolean,
+    verdict: AnswerVerdict | 'timeout',
     responseTimeMs: number | null
   ): void {
     this.results.push({
@@ -803,18 +1302,19 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
       roomId: chat.paneLog.roomID,
       questionIndex: item.index,
       question: item.question,
-      expected: item.expectedAnswer,
+      expected: expectedAnswersLabel(item),
       answer,
-      correct,
-      timedOut,
+      correct: verdict === 'correct',
+      partial: verdict === 'partial',
+      timedOut: verdict === 'timeout',
       responseTimeMs
     });
   }
 
   private averageTime(results: EvaluationResult[]): number | null {
-    const times = results
-      .filter(result => !result.timedOut && result.responseTimeMs != null)
-      .map(result => result.responseTimeMs as number);
+    const times = results.flatMap(result =>
+      !result.timedOut && result.responseTimeMs != null ? [result.responseTimeMs] : []
+    );
     if (times.length === 0) {
       return null;
     }
@@ -831,22 +1331,20 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     }
     let points = 0;
     if (result.correct) {
-      points += this.correctPoints;
+      points += this.grading.correctPoints;
+    } else if (result.partial) {
+      points += this.grading.partialPoints;
     }
-    if (this.hasFastBonus(result)) {
-      points += this.fastBonusPoints;
-    }
-    return points;
+    return points + this.bonusForResult(result);
   }
 
-  private hasFastBonus(result: EvaluationResult): boolean {
-    if (result.timedOut || result.responseTimeMs == null) {
-      return false;
-    }
-    if (result.responseTimeMs < this.ultraFastThresholdMs) {
-      return true;
-    }
-    return result.correct && result.responseTimeMs < this.fastThresholdMs;
+  private bonusForResult(result: EvaluationResult): number {
+    const eligible = !result.timedOut && (!this.grading.speedBonusCorrectOnly || result.correct);
+    return speedBonusPoints(result.responseTimeMs, this.grading, eligible);
+  }
+
+  formatBonus(points: number | null | undefined): string {
+    return formatBonusPoints(points || 0);
   }
 
   private log(level: EvaluationLogEntry['level'], message: string, username?: string, roomId?: string): void {
@@ -862,70 +1360,8 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     window.URL.revokeObjectURL(url);
   }
 
-  private buildSummaryPdf(): Blob {
-    const header = [
-      'Chat',
-      ...this.questions.map(item => `Q${item.index + 1}`),
-      'Average',
-      'Fastest',
-      'Longest',
-      'Grade'
-    ];
-    const rows = this.chatScoreRows.map(row => [
-      row.username,
-      ...row.answers.map(answer => {
-        const verdict = answer.verdict ?? '-';
-        const time = answer.timeMs == null ? '' : this.formatResponseTime(answer.timeMs);
-        const bonus = answer.fastBonus ? ' +0.2' : '';
-        return `${verdict} ${time}${bonus}`.trim();
-      }),
-      this.formatResponseTime(row.avgMs),
-      this.formatTimedQuestion(row.fastestMs, row.fastestQuestion),
-      this.formatTimedQuestion(row.longestMs, row.longestQuestion),
-      this.formatGrade(row.grade)
-    ]);
-    const lines = [
-      'Automated evaluation summary',
-      '1 point per correct. +0.2 if correct and under 3s, or if any reply is under 0.2s.',
-      '',
-      header.join(' | '),
-      ...rows.map(row => row.join(' | '))
-    ];
-    return this.createSimplePdf(lines);
-  }
-
-  private createSimplePdf(lines: string[]): Blob {
-    const escapePdf = (value: string) => value
-      .replace(/\\/g, '\\\\')
-      .replace(/\(/g, '\\(')
-      .replace(/\)/g, '\\)')
-      .replace(/[^\x20-\x7E]/g, '?');
-    const commands = lines.map((line, index) => {
-      const y = 560 - index * 14;
-      return `BT /F1 9 Tf 30 ${y} Td (${escapePdf(line)}) Tj ET`;
-    }).join('\n');
-    const stream = commands + '\n';
-    const objects = [
-      '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n',
-      '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n',
-      '3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n',
-      '4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n',
-      `5 0 obj << /Length ${stream.length} >> stream\n${stream}endstream\nendobj\n`
-    ];
-    let body = '%PDF-1.4\n';
-    const offsets = [0];
-    objects.forEach(object => {
-      offsets.push(body.length);
-      body += object;
-    });
-    const xrefStart = body.length;
-    let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
-    for (let i = 1; i < offsets.length; i++) {
-      xref += `${offsets[i].toString().padStart(10, '0')} 00000 n \n`;
-    }
-    body += xref;
-    body += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`;
-    return new Blob([body], {type: 'application/pdf'});
+  private buildSummaryExcel(): Blob {
+    return createSummaryExcelBlob(this.questions.length, this.chatScoreRows, this.grading);
   }
 
   private shorten(text: string): string {
@@ -968,15 +1404,19 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
       lines.push('(no scored questions)');
     } else {
       chatResults.forEach(result => {
-        lines.push(
+        const verdict = result.timedOut ? 'TIMEOUT' : (result.correct ? 'CORRECT' : (result.partial ? 'PARTIAL' : 'INCORRECT'));
+        const entry = [
           `Q${result.questionIndex + 1}: ${result.question}`,
           `Expected: ${result.expected}`,
           `Answer: ${result.timedOut ? '(no answer)' : result.answer}`,
-          `Result: ${result.timedOut ? 'TIMEOUT' : (result.correct ? 'CORRECT' : 'INCORRECT')}`,
-          `Response time: ${this.formatResponseTime(result.responseTimeMs)}`,
-          `Points: ${this.formatGrade(this.pointsForResult(result))}`,
-          ''
-        );
+          `Result: ${verdict}`,
+          `Response time: ${this.formatResponseTime(result.responseTimeMs)}`
+        ];
+        if (this.grading.showGradesInLogs) {
+          entry.push(`Points: ${this.formatGrade(this.pointsForResult(result))}`);
+        }
+        entry.push('');
+        lines.push(...entry);
       });
     }
 
@@ -985,7 +1425,9 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     lines.push(`Average: ${this.formatResponseTime(row?.avgMs ?? null)}`);
     lines.push(`Fastest: ${this.formatTimedQuestion(row?.fastestMs ?? null, row?.fastestQuestion ?? null)}`);
     lines.push(`Longest: ${this.formatTimedQuestion(row?.longestMs ?? null, row?.longestQuestion ?? null)}`);
-    lines.push(`Grade: ${this.formatGrade(row?.grade ?? 0)} (1 per correct, +0.2 if correct and under 3s or any reply under 0.2s)`);
+    if (this.grading.showGradesInLogs) {
+      lines.push(`Grade: ${this.formatGrade(row?.grade ?? 0)} (${this.scoringRulesText})`);
+    }
     return lines.join('\n');
   }
 
@@ -1001,5 +1443,25 @@ export class AutomatedEvaluationComponent implements OnInit, OnDestroy {
     const date = new Date(ms);
     const pad = (value: number) => value.toString().padStart(2, '0');
     return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+
+  private errorMessage(error: unknown, fallback: string): string {
+    return error instanceof Error && error.message ? error.message : fallback;
+  }
+
+  private errorName(error: unknown): string {
+    return error instanceof Error ? error.name : '';
+  }
+
+  private httpStatus(error: unknown): number | undefined {
+    return error instanceof HttpErrorResponse ? error.status : undefined;
+  }
+
+  private httpErrorDescription(error: HttpErrorResponse, fallback: string): string {
+    const body = error.error;
+    if (body && typeof body === 'object' && typeof (body as {description?: unknown}).description === 'string') {
+      return (body as {description: string}).description;
+    }
+    return fallback;
   }
 }

@@ -1,28 +1,261 @@
 export interface EvaluationQuestion {
   index: number
   question: string
-  expectedAnswer: string
+  expectedAnswers: string[]
 }
 
 /**
- * Parses the automated-evaluation questions file.
+ * Parses an evaluation questions file.
  *
- * Expected format: a numbered list of questions, a blank line, then a numbered list of answers.
+ * Preferred block format (supports multi-line SPARQL):
+ *
+ *   Q: Who directed Titanic?
+ *   A: James Cameron
+ *
+ *   ---
+ *   Q:
+ *   SELECT ?movie WHERE {
+ *     ?movie dbo:director dbr:James_Cameron .
+ *   }
+ *   A: Titanic
+ *   A: Avatar
+ *
+ * JSON is also accepted: [{"question":"...","answers":["a","b"]}]
+ * The older numbered list (questions, blank line, answers) still works.
  */
 export function parseQuestionsFile(raw: string): EvaluationQuestion[] {
-  const text = raw.replace(/\r\n/g, '\n').trim()
+  const text = raw.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').trim()
   if (!text) {
     throw new Error('The questions file is empty.')
   }
 
-  const blocks = text.split(/\n\s*\n/)
+  const parsed = text.startsWith('[') || text.startsWith('{')
+    ? parseJsonQuestions(text)
+    : looksLikeBlockFormat(text)
+      ? parseBlockQuestions(text)
+      : parseLegacyQuestions(text)
+
+  if (parsed.length === 0) {
+    throw new Error('No questions were found in the file.')
+  }
+  return parsed
+}
+
+export function expectedAnswersLabel(item: EvaluationQuestion): string {
+  return item.expectedAnswers.join(' / ')
+}
+
+export type AnswerVerdict = 'correct' | 'partial' | 'incorrect'
+
+export function answersMatch(expected: string | string[], actual: string): boolean {
+  return scoreAnswer(expected, actual) === 'correct'
+}
+
+
+export function scoreAnswer(expected: string | string[], actual: string): AnswerVerdict {
+  const candidates = (Array.isArray(expected) ? expected : [expected])
+    .map(candidate => candidate.trim())
+    .filter(candidate => candidate.length > 0)
+  if (candidates.length === 0) {
+    return 'incorrect'
+  }
+  const verdicts = candidates.map(candidate => scoreAlternative(candidate, actual))
+  if (verdicts.includes('correct')) {
+    return 'correct'
+  }
+  if (verdicts.includes('partial')) {
+    return 'partial'
+  }
+  return 'incorrect'
+}
+
+function scoreAlternative(expected: string, actual: string): AnswerVerdict {
+  const parts = expected
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part.length > 0)
+  if (parts.length === 0) {
+    return 'incorrect'
+  }
+  const hits = parts.map(part => matchPart(actual, part))
+  const full = hits.filter(hit => hit === 'full').length
+  const partial = hits.filter(hit => hit === 'partial').length
+  if (parts.length === 1) {
+    return full === 1 ? 'correct' : 'incorrect'
+  }
+  if (full === parts.length) {
+    return 'correct'
+  }
+  if (full + partial > 0) {
+    return 'partial'
+  }
+  return 'incorrect'
+}
+
+function matchPart(actual: string, expectedPart: string): 'full' | 'partial' | 'miss' {
+  const expectedNorm = normalizeAnswer(expectedPart)
+  const actualNorm = normalizeAnswer(actual)
+  if (!expectedNorm || !actualNorm) {
+    return 'miss'
+  }
+  if (occursIn(actualNorm, expectedNorm)) {
+    return 'full'
+  }
+  const qid = expectedNorm.match(/\bq\d+\b/)
+  if (qid && occursIn(actualNorm, qid[0])) {
+    return 'full'
+  }
+  const name = nameWithoutId(expectedNorm)
+  if (name && name !== expectedNorm && occursIn(actualNorm, name)) {
+    return 'partial'
+  }
+  return 'miss'
+}
+
+function nameWithoutId(value: string): string {
+  return value
+    .replace(/\(\s*q\d+\s*\)/g, ' ')
+    .replace(/\bq\d+\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function occursIn(haystack: string, needle: string): boolean {
+  if (/^[a-z0-9]+$/.test(needle)) {
+    return new RegExp(`(^|[^a-z0-9])${needle}([^a-z0-9]|$)`).test(haystack)
+  }
+  return haystack.includes(needle)
+}
+
+function normalizeAnswer(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function looksLikeBlockFormat(text: string): boolean {
+  return /^\s*---+\s*$/m.test(text) || /^\s*Q\s*:/m.test(text)
+}
+
+function parseBlockQuestions(text: string): EvaluationQuestion[] {
+  return text
+    .split(/^\s*---+\s*$/m)
+    .map(record => parseBlockRecord(record))
+    .filter((item): item is {question: string, expectedAnswers: string[]} => item != null)
+    .map((item, index) => ({index, ...item}))
+}
+
+function parseBlockRecord(record: string): {question: string, expectedAnswers: string[]} | null {
+  const lines = record.replace(/\r\n/g, '\n').split('\n')
+  let current: 'q' | 'a' | null = null
+  let question = ''
+  let currentAnswer = ''
+  const answers: string[] = []
+
+  const flushAnswer = () => {
+    if (current !== 'a') {
+      return
+    }
+    splitAcceptedAnswers(currentAnswer).forEach(answer => answers.push(answer))
+    currentAnswer = ''
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (current == null && (trimmed.length === 0 || trimmed.startsWith('#'))) {
+      continue
+    }
+
+    const questionMatch = line.match(/^Q\s*:\s?(.*)$/i)
+    if (questionMatch) {
+      flushAnswer()
+      current = 'q'
+      question = appendLine(question, questionMatch[1])
+      continue
+    }
+
+    const answerMatch = line.match(/^A\s*:\s?(.*)$/i)
+    if (answerMatch) {
+      flushAnswer()
+      current = 'a'
+      currentAnswer = answerMatch[1]
+      continue
+    }
+
+    if (current === 'q') {
+      question = appendLine(question, line)
+    } else if (current === 'a') {
+      currentAnswer = appendLine(currentAnswer, line)
+    }
+  }
+  flushAnswer()
+
+  const cleanQuestion = question.trim()
+  if (!cleanQuestion || answers.length === 0) {
+    return null
+  }
+  return {question: cleanQuestion, expectedAnswers: answers}
+}
+
+function parseJsonQuestions(raw: string): EvaluationQuestion[] {
+  let data: unknown
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    throw new Error('The questions JSON file is invalid.')
+  }
+
+  const rows = Array.isArray(data)
+    ? data
+    : (data && typeof data === 'object' && Array.isArray((data as {questions?: unknown}).questions))
+      ? (data as {questions: unknown[]}).questions
+      : null
+  if (!rows) {
+    throw new Error('JSON must be an array of {question, answers} objects.')
+  }
+
+  return rows.map((row, index) => {
+    if (!row || typeof row !== 'object') {
+      throw new Error(`Question ${index + 1} is not an object.`)
+    }
+    const item = row as Record<string, unknown>
+    const question = String(item.question ?? item.q ?? '').trim()
+    const answers = collectJsonAnswers(item)
+    if (!question) {
+      throw new Error(`Question ${index + 1} is missing a question.`)
+    }
+    if (answers.length === 0) {
+      throw new Error(`Question ${index + 1} is missing accepted answers.`)
+    }
+    return {index, question, expectedAnswers: answers}
+  })
+}
+
+function collectJsonAnswers(item: Record<string, unknown>): string[] {
+  const lists = [item.answers, item.expectedAnswers, item.accepted]
+  for (const list of lists) {
+    if (Array.isArray(list)) {
+      return list.map(value => String(value).trim()).filter(value => value.length > 0)
+    }
+  }
+  const single = item.answer ?? item.expected ?? item.expectedAnswer
+  if (typeof single === 'string' && single.trim()) {
+    return splitAcceptedAnswers(single)
+  }
+  return []
+}
+
+function parseLegacyQuestions(raw: string): EvaluationQuestion[] {
+  const blocks = raw.split(/\n\s*\n/)
   if (blocks.length < 2) {
-    throw new Error('The questions file must contain a question list and an answer list separated by a blank line.')
+    throw new Error('Use Q:/A: blocks separated by --- , or a numbered question list and answer list separated by a blank line.')
   }
 
   const questions = parseNumberedLines(blocks[0])
   const answers = parseNumberedLines(blocks.slice(1).join('\n'))
-
   if (questions.length === 0) {
     throw new Error('No questions were found in the file.')
   }
@@ -30,10 +263,10 @@ export function parseQuestionsFile(raw: string): EvaluationQuestion[] {
     throw new Error(`Found ${questions.length} questions but ${answers.length} answers.`)
   }
 
-  return questions.map((question, i) => ({
-    index: i,
+  return questions.map((question, index) => ({
+    index,
     question,
-    expectedAnswer: answers[i]
+    expectedAnswers: splitAcceptedAnswers(answers[index])
   }))
 }
 
@@ -46,20 +279,20 @@ function parseNumberedLines(block: string): string[] {
     .filter(line => line.length > 0)
 }
 
-export function answersMatch(expected: string, actual: string): boolean {
-  const expectedNorm = normalizeAnswer(expected)
-  const actualNorm = normalizeAnswer(actual)
-  if (!expectedNorm || !actualNorm) {
-    return false
+function splitAcceptedAnswers(value: string): string[] {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return []
   }
-  return actualNorm.includes(expectedNorm) || expectedNorm.includes(actualNorm)
+  if (trimmed.includes('\n')) {
+    return [trimmed]
+  }
+  return trimmed
+    .split(/\s+\|\s+/)
+    .map(part => part.trim())
+    .filter(part => part.length > 0)
 }
 
-function normalizeAnswer(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[‘’]/g, "'")
-    .replace(/[“”]/g, '"')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
+function appendLine(current: string, line: string): string {
+  return current.length === 0 ? line : `${current}\n${line}`
 }

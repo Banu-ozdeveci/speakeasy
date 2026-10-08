@@ -7,6 +7,7 @@ import ch.ddis.speakeasy.cli.Cli
 import ch.ddis.speakeasy.db.DatabaseHandler
 import ch.ddis.speakeasy.feedback.FeedbackManager
 import ch.ddis.speakeasy.feedback.FormManager
+import ch.ddis.speakeasy.mail.EvaluationMailer
 import ch.ddis.speakeasy.feedback.AutomatedEvaluationQuestions
 import ch.ddis.speakeasy.user.UserManager
 import ch.ddis.speakeasy.util.Config
@@ -74,6 +75,7 @@ object Speakeasy : CliktCommand(help = "Runs the Speakeasy application") {
         ChatRoomManager.init(config)
         FormManager.init(config)
         AutomatedEvaluationQuestions.init(config)
+        EvaluationMailer.init(config)
 
         println("Starting api")
         RestApi.init(config)
